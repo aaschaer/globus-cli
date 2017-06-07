@@ -4,18 +4,17 @@ import webbrowser
 import click
 
 from globus_sdk import AuthClient, AccessTokenAuthorizer
+# from globus_sdk.auth.oauth2_constants import DEFAULT_REQUESTED_SCOPES
 
 from globus_cli.helpers import (
     start_local_server, is_remote_session, LocalServerError)
 from globus_cli.safeio import safeprint
 from globus_cli.parsing import common_options
 from globus_cli.config import (
-    AUTH_RT_OPTNAME, TRANSFER_RT_OPTNAME,
-    AUTH_AT_OPTNAME, TRANSFER_AT_OPTNAME,
-    AUTH_AT_EXPIRES_OPTNAME, TRANSFER_AT_EXPIRES_OPTNAME,
     WHOAMI_ID_OPTNAME, WHOAMI_USERNAME_OPTNAME,
     WHOAMI_EMAIL_OPTNAME, WHOAMI_NAME_OPTNAME,
-    internal_auth_client, write_option, lookup_option)
+    internal_auth_client, write_option,
+    get_tokens_by_resource_server, write_tokens_by_resource_server)
 
 
 _SHARED_EPILOG = ("""\
@@ -49,52 +48,105 @@ You may force a new login with
 @common_options(no_format_option=True, no_map_http_status_option=True)
 @click.option('--force', is_flag=True,
               help=('Do a fresh login, ignoring any existing credentials'))
+@click.option("--check", is_flag=True,
+              help=("Only check if the user already has existing credentials "
+                    "without doing a login flow. Mutually exclusive with "
+                    "--force and --no-local-server"))
 @click.option("--no-local-server", is_flag=True,
               help=("Manual login by copying and pasting an auth code. "
                     "This will be implied if using a remote connection."))
-def login_command(force, no_local_server):
+@click.option("--ssh", metavar="FQDN", default=None,
+              help=("Login to Globus to give the CLI credentials for the "
+                    "SSH server with the given Fully Qualified Domain Name."))
+def login_command(force, check, no_local_server, ssh):
+    # fail if check is given with any options that are used in actual login
+    if check and (force or no_local_server):
+        raise click.UsageError(
+            "--check cannot be used with options that require a login flow.")
+
+    # determine which resource servers we need based on options
+    if ssh:
+        # auth is required for user data
+        resource_servers = ["auth", ssh]
+    else:
+        resource_servers = ["auth", "transfer"]
+
+    # check if the user is already logged in, and stop now if check is true
+    logged_in = check_logged_in(resource_servers)
+    if check:
+        resource_server_string = (
+            resource_servers[0] + " and " + resource_servers[1])
+        if logged_in:
+            safeprint(("The Globus CLI is authorized to make calls to {} on "
+                       "your behalf.".format(resource_server_string)))
+            return
+        else:
+            safeprint(("You have not authorized the Globus CLI to make calls "
+                      "to {} on your behalf.".format(resource_server_string)))
+            click.get_current_context().exit(1)
+
     # if not forcing, stop if user already logged in
-    if not force and check_logged_in():
+    if not force and logged_in:
         safeprint(_LOGGED_IN_RESPONSE)
         return
 
+    # get the scopes needed for this login
+    scopes = get_scopes(resource_servers)
+
     # use a link login if remote session or user requested
     if no_local_server or is_remote_session():
-        do_link_login_flow()
+        do_link_login_flow(scopes)
     # otherwise default to a local server login flow
     else:
-        do_local_server_login_flow()
+        do_local_server_login_flow(scopes)
 
 
-def check_logged_in():
-    # first, pull up all of the data from config and see what we can get
-    # we can skip the access tokens and their expiration times as those are not
-    # strictly necessary
-    transfer_rt = lookup_option(TRANSFER_RT_OPTNAME)
-    auth_rt = lookup_option(AUTH_RT_OPTNAME)
-    # whoami data -- consider required for now
-    whoami_id = lookup_option(WHOAMI_ID_OPTNAME)
-    whoami_username = lookup_option(WHOAMI_USERNAME_OPTNAME)
-    whoami_email = lookup_option(WHOAMI_EMAIL_OPTNAME)
-    whoami_name = lookup_option(WHOAMI_NAME_OPTNAME)
-
-    # if any of these values are null return False
-    if (transfer_rt is None or auth_rt is None or
-            whoami_id is None or whoami_username is None or
-            whoami_email is None or whoami_name is None):
-        return False
-
-    # check that tokens are valid
+def check_logged_in(resource_servers):
+    """
+    Determines if the user has a valid refresh token for the required
+    resources server. If no resource server is given, checks transfer
+    and auth as a default.
+    """
+    # get the NativeApp client object
     native_client = internal_auth_client()
-    for tok in (transfer_rt, auth_rt):
-        res = native_client.oauth2_validate_token(tok)
-        if not res['active']:
+
+    # for each resource server required for login
+    for server in resource_servers:
+        # get any tokens in config for that resource server
+        tokens = get_tokens_by_resource_server(server)
+        refresh_token = tokens.get("refresh_token")
+        # return false if no token exists or if it is no longer active
+        if not refresh_token:
+            return False
+        res = native_client.oauth2_validate_token(refresh_token)
+        if not res["active"]:
             return False
 
     return True
 
 
-def do_link_login_flow():
+def get_scopes(resource_servers):
+    """
+    Gets the scopes required for a login flow.
+    """
+    scopes = []
+    for server in resource_servers:
+
+        if server == "auth":
+            scopes.extend(["openid", "profile", "email"])
+
+        elif server == "transfer":
+            scopes.append("urn:globus:auth:scope:transfer.api.globus.org:all")
+
+        else:
+            # TODO: verify the server, and determine what scopes it needs
+            # for now, just return the "all" scope for each server
+            scopes.append(
+                "urn:globus:auth:scope:{}:all".format(server))
+    return scopes
+
+
+def do_link_login_flow(scopes):
     """
     Prompts the user with a link to authorize the CLI to act on their behalf.
     """
@@ -106,6 +158,7 @@ def do_link_login_flow():
     # hostname for the local system
     label = platform.node() or None
     native_client.oauth2_start_flow(
+        requested_scopes=scopes,
         refresh_tokens=True, prefill_named_grant=label)
 
     # prompt
@@ -119,10 +172,10 @@ def do_link_login_flow():
         'Enter the resulting Authorization Code here').strip()
 
     # finish login flow
-    exchange_code_and_store_config(native_client, auth_code)
+    exchange_code_and_update_config(native_client, auth_code)
 
 
-def do_local_server_login_flow():
+def do_local_server_login_flow(scopes):
     """
     Starts a local http server, opens a browser to have the user login,
     and gets the code redirected to the server (no copy and pasting required)
@@ -143,6 +196,7 @@ def do_local_server_login_flow():
         label = platform.node() or None
         native_client = internal_auth_client()
         native_client.oauth2_start_flow(
+            requested_scopes=scopes,
             refresh_tokens=True, prefill_named_grant=label,
             redirect_uri=redirect_uri)
         url = native_client.oauth2_get_authorize_url()
@@ -160,35 +214,42 @@ def do_local_server_login_flow():
         click.get_current_context().exit(1)
 
     # finish login flow
-    exchange_code_and_store_config(native_client, auth_code)
+    exchange_code_and_update_config(native_client, auth_code)
 
 
-def exchange_code_and_store_config(native_client, auth_code):
+def exchange_code_and_update_config(native_client, auth_code):
     """
     Finishes login flow after code is gotten from command line or local server.
     Exchanges code for tokens and gets user info from auth.
     Stores tokens and user info in config.
     """
     # do a token exchange with the given code
-    tkn = native_client.oauth2_exchange_code_for_tokens(auth_code)
-    tkn = tkn.by_resource_server
+    res = native_client.oauth2_exchange_code_for_tokens(auth_code)
+    tokens = res.by_resource_server
 
-    # extract access tokens from final response
-    transfer_at = (
-        tkn['transfer.api.globus.org']['access_token'])
-    transfer_at_expires = (
-        tkn['transfer.api.globus.org']['expires_at_seconds'])
-    transfer_rt = (
-        tkn['transfer.api.globus.org']['refresh_token'])
-    auth_at = (
-        tkn['auth.globus.org']['access_token'])
-    auth_at_expires = (
-        tkn['auth.globus.org']['expires_at_seconds'])
-    auth_rt = (
-        tkn['auth.globus.org']['refresh_token'])
+    for server in tokens:
 
-    # get the identity that the tokens were issued to
-    auth_client = AuthClient(authorizer=AccessTokenAuthorizer(auth_at))
+        # backwards compatibility
+        if server == "transfer.api.globus.org":
+            server_name = "transfer"
+        elif server == "auth.globus.org":
+            server_name = "auth"
+        else:
+            server_name = server
+
+        # revoke any existing tokens
+        existing_tokens = get_tokens_by_resource_server(server_name)
+        for token_type in ["access_token", "refresh_token"]:
+            token = existing_tokens.get(token_type)
+            if token:
+                native_client.oauth2_revoke_token(token)
+
+        # write new token data
+        write_tokens_by_resource_server(server_name, tokens[server])
+
+    # get the identity that the tokens were issued to (assumes auth in scopes)
+    auth_client = AuthClient(authorizer=AccessTokenAuthorizer(
+        tokens["auth.globus.org"]["access_token"]))
     res = auth_client.get('/p/whoami')
 
     # get the primary identity
@@ -197,20 +258,6 @@ def exchange_code_and_store_config(native_client, auth_code):
     # in the list is the primary.
     identity = res['identities'][0]
 
-    # revoke any existing tokens
-    for token_opt in (TRANSFER_RT_OPTNAME, TRANSFER_AT_OPTNAME,
-                      AUTH_RT_OPTNAME, AUTH_AT_OPTNAME):
-        token = lookup_option(token_opt)
-        if token:
-            native_client.oauth2_revoke_token(token)
-
-    # write new tokens to config
-    write_option(TRANSFER_RT_OPTNAME, transfer_rt)
-    write_option(TRANSFER_AT_OPTNAME, transfer_at)
-    write_option(TRANSFER_AT_EXPIRES_OPTNAME, transfer_at_expires)
-    write_option(AUTH_RT_OPTNAME, auth_rt)
-    write_option(AUTH_AT_OPTNAME, auth_at)
-    write_option(AUTH_AT_EXPIRES_OPTNAME, auth_at_expires)
     # write whoami data to config
     write_option(WHOAMI_ID_OPTNAME, identity['id'])
     write_option(WHOAMI_USERNAME_OPTNAME, identity['username'])

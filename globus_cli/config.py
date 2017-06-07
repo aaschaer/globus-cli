@@ -144,6 +144,50 @@ def get_output_format():
     return lookup_option(OUTPUT_FORMAT_OPTNAME)
 
 
+def get_tokens_by_resource_server(resource_server):
+    """
+    Gets access and refresh tokens and expiration data from config
+    using the given resource server as a unique name for lookup.
+    Returns a dict with "access_token", "refresh_token" and
+    "access_token_expires" fields.
+    """
+    prefix = GLOBUS_ENV + "_" if GLOBUS_ENV else ""
+    prefix += resource_server + "_"
+
+    expires = lookup_option("{}expires_at_seconds".format(prefix))
+    if expires is not None:
+        expires = int(expires)
+
+    return {
+        "refresh_token": lookup_option(
+            "{}refresh_token".format(prefix)),
+        "access_token": lookup_option(
+            "{}access_token".format(prefix)),
+        "access_token_expires": expires
+    }
+
+
+def write_tokens_by_resource_server(resource_server, tokens):
+    """
+    Writes access and refresh tokens and expiration data to config
+    using the given resource_server as a unique name.
+    Expects tokens to be a dict, and writes data from the fields
+    "access_token", "refresh_token" and "expires_at_seconds".
+    """
+    prefix = GLOBUS_ENV + "_" if GLOBUS_ENV else ""
+    prefix += resource_server + "_"
+
+    if tokens.get("refresh_token"):
+        write_option("{}refresh_token".format(prefix),
+                     tokens["refresh_token"])
+    if tokens.get("access_token"):
+        write_option("{}access_token".format(prefix),
+                     tokens["access_token"])
+    if tokens.get("expires_at_seconds"):
+        write_option("{}access_token_expires".format(prefix),
+                     tokens["expires_at_seconds"])
+
+
 def get_auth_tokens():
     expires = lookup_option(AUTH_AT_EXPIRES_OPTNAME)
     if expires is not None:
