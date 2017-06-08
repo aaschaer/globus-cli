@@ -17,7 +17,8 @@ setup(
         'jmespath==0.9.2',
         'configobj>=5.0.6,<6.0.0',
         'requests>=2.0.0,<3.0.0',
-        'six>=1.10.0,<2.0.0'
+        'six>=1.10.0,<2.0.0',
+        'pyperclip>=1.5.27,<2.0.0'
     ],
 
     extras_require={

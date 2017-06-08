@@ -1,15 +1,13 @@
 import platform
 import webbrowser
-
+import pyperclip
 import click
-
-from globus_sdk import AuthClient, AccessTokenAuthorizer
-# from globus_sdk.auth.oauth2_constants import DEFAULT_REQUESTED_SCOPES
 
 from globus_cli.helpers import (
     start_local_server, is_remote_session, LocalServerError)
 from globus_cli.safeio import safeprint
 from globus_cli.parsing import common_options
+from globus_cli.services.auth import get_auth_client
 from globus_cli.config import (
     WHOAMI_ID_OPTNAME, WHOAMI_USERNAME_OPTNAME,
     WHOAMI_EMAIL_OPTNAME, WHOAMI_NAME_OPTNAME,
@@ -58,40 +56,70 @@ You may force a new login with
 @click.option("--ssh", metavar="FQDN", default=None,
               help=("Login to Globus to give the CLI credentials for the "
                     "SSH server with the given Fully Qualified Domain Name."))
-def login_command(force, check, no_local_server, ssh):
-    # fail if check is given with any options that are used in actual login
+@click.option("--copy", is_flag=True,
+              help=("If using ssh, attempts to copy the access token to the "
+                    "clipboard. Prints token to stdout if unable to do so."))
+def login_command(force, check, no_local_server, ssh, copy):
+    # confirm that options are valid
     if check and (force or no_local_server):
         raise click.UsageError(
             "--check cannot be used with options that require a login flow.")
+    if copy and not ssh:
+        raise click.UsageError(
+            "--copy can only be used with --ssh.")
 
-    # determine which resource servers we need based on options
+    # determine which resource servers we need based on options,
+    # auth and transfer are always required.
+    resource_servers = ["auth", "transfer"]
     if ssh:
-        # auth is required for user data
-        resource_servers = ["auth", ssh]
-    else:
-        resource_servers = ["auth", "transfer"]
+        resource_servers.append(ssh)
 
-    # check if the user is already logged in, and stop now if check is true
-    logged_in = check_logged_in(resource_servers)
+    # get the list of resource servers we do and don't have valid tokens for
+    logged_in, not_logged_in = check_logged_in(resource_servers)
     if check:
-        resource_server_string = (
-            resource_servers[0] + " and " + resource_servers[1])
-        if logged_in:
-            safeprint(("The Globus CLI is authorized to make calls to {} on "
-                       "your behalf.".format(resource_server_string)))
+
+        # still attempt copy if checking
+        if copy:
+            attempt_copy(ssh)
+
+        logged_string = (" ".join(logged_in[:-1]) +
+                         (" and " if len(logged_in) > 1 else "") +
+                         "".join(logged_in[-1:]))
+        not_logged_string = (" ".join(not_logged_in[:-1]) +
+                             (" or " if len(not_logged_in) > 1 else "") +
+                             "".join(not_logged_in[-1:]))
+
+        # print which of the required servers the CLI is/isn't authorized for
+        # exit 0 if authorized for all, 1 if not authorized for some
+        if len(not_logged_in) == 0:
+            safeprint(("You have authorized the Globus CLI to make calls to "
+                       "{} on your behalf".format(logged_string)))
             return
         else:
             safeprint(("You have not authorized the Globus CLI to make calls "
-                      "to {} on your behalf.".format(resource_server_string)))
+                       "to {} on your behalf.".format(not_logged_string)))
+            if len(logged_in):
+                safeprint(("But you have authorized the Globus CLI "
+                           "to make calls to {} on your behalf."
+                           .format(logged_string)))
             click.get_current_context().exit(1)
 
-    # if not forcing, stop if user already logged in
-    if not force and logged_in:
+    # if not forcing, stop if user already logged in for all resource servers
+    if not force and len(not_logged_in) == 0:
         safeprint(_LOGGED_IN_RESPONSE)
+
+        # still attempt copy even if logged in
+        if copy:
+            attempt_copy(ssh)
+
         return
 
     # get the scopes needed for this login
-    scopes = get_scopes(resource_servers)
+    if force:
+        scopes = get_scopes(resource_servers)
+    # if not forcing, only request scopes for servers we don't have tokens for
+    else:
+        scopes = get_scopes(not_logged_in)
 
     # use a link login if remote session or user requested
     if no_local_server or is_remote_session():
@@ -100,15 +128,24 @@ def login_command(force, check, no_local_server, ssh):
     else:
         do_local_server_login_flow(scopes)
 
+    # output login epilog (also confirms successful login)
+    output_epilog()
+
+    # if copy given attempt to copy the ssh access token to the clipboard
+    if copy:
+        attempt_copy(ssh)
+
 
 def check_logged_in(resource_servers):
     """
-    Determines if the user has a valid refresh token for the required
-    resources server. If no resource server is given, checks transfer
-    and auth as a default.
+    For a given list of resource_servers, returns a a tuple of two lists for
+    the servers that the user does and does not have a valid refresh_token for.
     """
     # get the NativeApp client object
     native_client = internal_auth_client()
+
+    not_logged_in = []
+    logged_in = []
 
     # for each resource server required for login
     for server in resource_servers:
@@ -117,12 +154,15 @@ def check_logged_in(resource_servers):
         refresh_token = tokens.get("refresh_token")
         # return false if no token exists or if it is no longer active
         if not refresh_token:
-            return False
+            not_logged_in.append(server)
+            continue
         res = native_client.oauth2_validate_token(refresh_token)
         if not res["active"]:
-            return False
+            not_logged_in.append(server)
+            continue
+        logged_in.append(server)
 
-    return True
+    return (logged_in, not_logged_in)
 
 
 def get_scopes(resource_servers):
@@ -247,9 +287,44 @@ def exchange_code_and_update_config(native_client, auth_code):
         # write new token data
         write_tokens_by_resource_server(server_name, tokens[server])
 
-    # get the identity that the tokens were issued to (assumes auth in scopes)
-    auth_client = AuthClient(authorizer=AccessTokenAuthorizer(
-        tokens["auth.globus.org"]["access_token"]))
+
+def attempt_copy(ssh_server):
+    """
+    Attempts to copy the access_token for the given ssh resource server
+    to the clipboard. Prints token to stdout if unable to do so.
+    """
+    token = get_tokens_by_resource_server(ssh_server)["access_token"]
+    fallback = False
+
+    if not token:
+        safeprint("Unable to copy access token: no access token exists.")
+
+    elif is_remote_session():
+        safeprint(("Unable to copy access token to clipboard over remote "
+                   "session."))
+        fallback = True
+
+    else:
+        try:
+            pyperclip.copy(token)
+            safeprint("Access token copied to clipboard.\n")
+        except Exception as e:
+            safeprint("Copy failed on: {}".format(e))
+            fallback = True
+
+    # if we were unable to copy for some reason, fall back to print
+    if fallback:
+        safeprint(("Displaying access token for manual copying:\n{}\n"
+                   .format(token)))
+
+
+def output_epilog():
+    """
+    Gets the newly-logged in identity, and prints the epilog.
+    Will fail if called before a successful login.
+    """
+    # get the identity that the tokens were issued to
+    auth_client = get_auth_client()
     res = auth_client.get('/p/whoami')
 
     # get the primary identity
