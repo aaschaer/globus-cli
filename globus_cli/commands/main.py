@@ -20,6 +20,8 @@ from globus_cli.commands.endpoint import endpoint_command
 from globus_cli.commands.bookmark import bookmark_command
 from globus_cli.commands.task import task_command
 
+from globus_cli.commands.ssh import ssh_command
+
 
 @globus_main_func
 def main():
@@ -45,3 +47,5 @@ main.add_command(transfer_command)
 main.add_command(endpoint_command)
 main.add_command(bookmark_command)
 main.add_command(task_command)
+
+main.add_command(ssh_command)
