@@ -1,7 +1,8 @@
 import click
+import six
 import os
 import pty
-import six
+import psutil
 
 from globus_cli.helpers import is_verbose, is_remote_session
 from globus_cli.parsing import common_options, HiddenOption
@@ -10,6 +11,12 @@ from globus_cli.commands.login import (
 from globus_cli.config import (
     get_tokens_by_resource_server, write_tokens_by_resource_server,
     internal_auth_client)
+
+
+# global bools for ssh_read state, starts with looking for prompt
+looking_for_prompt = True
+checking_for_success = False
+normal_read = False
 
 
 @click.command("ssh", short_help="Use oauth over ssh.",
@@ -75,6 +82,14 @@ def ssh_command(fqdn, no_local_server, password, ssh_args):
                 token = ref_res["access_token"]
                 write_tokens_by_resource_server(fqdn, ref_res)
 
+    def _get_ssh_process():
+        """
+        Returns a psutil.Process of the ssh process.
+        Assumes exactly one child has been spawned by the parent calling this.
+        """
+        parent = psutil.Process(os.getpid())
+        return psutil.Process(parent.children()[0].pid)
+
     def ssh_read(fd):
         """
         Function to be passed to pty.spawn as the master_read function.
@@ -82,24 +97,43 @@ def ssh_command(fqdn, no_local_server, password, ssh_args):
         If the line looks like a password prompt, writes the access token.
         Otherwise returns the line normally.
         """
+        global looking_for_prompt
+        global checking_for_success
+        global normal_read
         data = os.read(fd, 1024)
-        # print b"read {} lines from master: {}".format(len(data), data)
 
-        # TODO: use less naive way of detecting password,
-        # and stop looking / fail after first prompt
-        if b"assword:" in data:
-            os.write(fd, six.b(token) + b"\n")
-            return b"Access token sent.\n"
-        else:
-            return data
+        if not normal_read:
+            # if we have gotten a command prompt, likely in normal reading
+            prompt_chars = ["$", "%", ">"]
+            if any(char in data for char in prompt_chars):
+                looking_for_prompt = False
+                checking_for_success = False
+                normal_read = True
+
+        if looking_for_prompt:
+            # if password in data, likely password prompt
+            if b"assword" in data:
+                os.write(fd, six.b(token) + b"\n")
+                looking_for_prompt = False
+                checking_for_success = True
+                return b"Access token sent.\n"
+
+        if checking_for_success:
+            # denied, try again, and password are likely markers of a failure
+            fail_terms = [b"enied", b"gain", b"assword"]
+            if any(term in data for term in fail_terms):
+                # terminate ssh process and return a failure message.
+                _get_ssh_process().terminate()
+                return b"Access token not accepted, terminating ssh.\n"
+
+        return data
 
     # start ssh pty with the FQDN using any additional arguments
     ssh_args = (b"ssh", six.b(fqdn),) + ssh_args
 
-    # TDOD: confirm this is returning the exit code.
-    # docs claim it should be a tuple of pid, exit_code.
-    exc = pty.spawn(ssh_args, ssh_read)
+    # spawn ssh in a pseudo terminal
+    pty.spawn(ssh_args, ssh_read)
 
-    # TODO: find a way exit with ssh's exit code on python > 3.4
-    if exc:
-        click.get_current_context().exit(exc)
+    # and exit with its exit code when it completes
+    exit_code = _get_ssh_process().wait()
+    click.get_current_context().exit(exit_code)
